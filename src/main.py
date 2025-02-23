@@ -1,9 +1,10 @@
 import time
 import warnings
 from tqdm import tqdm
-
+import numpy as np
 from kmeans_gpu import KMeans
 import torch.optim.optimizer
+from sklearn.metrics import precision_score, recall_score, f1_score
 
 from torch.cuda.amp import GradScaler, autocast
 import torch.nn.functional as F
@@ -66,6 +67,9 @@ def main():
 def main_worker(args):
     train_losses, train_accs = [], []
     val_losses, val_accs = [],[]
+    train_precisions, train_recalls, train_f1s = [], [], [] 
+    val_precisions, val_recalls, val_f1s = [], [], []
+
     # load_dataset
     train_transform, test_transform = load_transform(args)
     train_dataset, test_dataset, num_classes = load_dataset(
@@ -157,7 +161,10 @@ def main_worker(args):
             num_per_classes,
             tf_writer,
             train_losses,
-            train_accs,     
+            train_accs,
+            train_precisions,
+            train_recalls,
+            train_f1s  
         )
 
         # evaluate on validation set
@@ -170,6 +177,9 @@ def main_worker(args):
             args,
             val_losses,
             val_accs, 
+            val_precisions,
+            val_recalls,
+            val_f1s,
             tf_writer,
         )
 
@@ -260,13 +270,18 @@ def train(
     num_per_classes,
     tf_writer,
     train_losses,
-    train_accs
+    train_accs,
+    train_precisions,
+    train_recalls,
+    train_f1s
 ):
     batch_time = AverageMeter("Time", ":6.3f")
     ce_loss_all = AverageMeter("CE_Loss", ":.4e")
     scl_loss_all = AverageMeter("SCL_Loss", ":.4e")
     centroid_loss_all = AverageMeter("CEN_Loss", ":.4e")
     top1 = AverageMeter("Acc@1", ":6.2f")
+    
+    y_true, y_pred = [], []  # Track predictions and labels
 
     model.train()
     end = time.time()
@@ -357,6 +372,15 @@ def train(
         acc1 = accuracy(logits, targets, topk=(1,))
         top1.update(acc1[0].item(), batch_size)
 
+         # Store predictions and labels
+        y_true.extend(targets.cpu().numpy())  # Store true labels
+        y_pred.extend(torch.argmax(logits, dim=1).cpu().numpy())  # Store predicted labels
+
+        # ✅ Compute Precision, Recall, and F1-score at the END of epoch
+        precision = precision_score(y_true, y_pred, average="macro", zero_division=0)
+        recall = recall_score(y_true, y_pred, average="macro", zero_division=0)
+        f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
+
         optimizer.zero_grad()
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -372,6 +396,9 @@ def train(
                 f"CE({ce_loss_all.avg:.4f}, {ce_loss_all.val:.4f}) "
                 f"SCL_v({scl_loss_all.avg:.6f}, {scl_loss_all.val:.6f}) "
                 f"Top-1_Accuracy({top1.avg:.3f}, {top1.val:.3f})"
+                f"Prec({precision:.3f}) "
+                f"Rec({recall:.3f}) "
+                f"F1({f1:.3f})"
             )
         else:
             pbar.set_description(
@@ -381,30 +408,38 @@ def train(
                 f"SCL_v({scl_loss_all.avg:.6f}, {scl_loss_all.val:.6f}) "
                 f"CL({centroid_loss_all.avg:.6f}, {centroid_loss_all.val:.6f} "
                 f"Top-1_Accuracy({top1.avg:.3f}, {top1.val:.3f})"
+                f"Prec({precision:.3f}) "
+                f"Rec({recall:.3f}) "
+                f"F1({f1:.3f})"
             )
-    # Append loss and accuracy after the epoch ends
+    # ✅ Append metrics to tracking lists
     train_losses.append(ce_loss_all.avg)
     train_accs.append(top1.avg)
-    
+    train_precisions.append(precision)
+    train_recalls.append(recall)
+    train_f1s.append(f1)
+
+    # ✅ Compute Precision, Recall, and F1-score at the END of epoch
+    precision = precision_score(y_true, y_pred, average="macro", zero_division=0)
+    recall = recall_score(y_true, y_pred, average="macro", zero_division=0)
+    f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
+
     num_per_classes = num_per_classes + count_labels.detach().cpu().numpy()
 
     tf_writer.add_scalar("loss/CE_train", ce_loss_all.avg, epoch)
     tf_writer.add_scalar("loss/SCL_train", scl_loss_all.avg, epoch)
+
     if args.warmup_epochs <= epoch:
         tf_writer.add_scalar("loss/CL_train", centroid_loss_all.avg, epoch)
-        # save_plot(centroid_loss_all.history, "Centroid Loss", "Loss", "train_centroid_curve")
 
     tf_writer.add_scalar("acc/train_top1", top1.avg, epoch)
 
-    # # Save training loss curve
-    # save_plot(ce_loss_all.history, "Cross-Entropy Loss", "Loss", "train_loss_curve")
-    # save_plot(scl_loss_all.history, "SupCon Loss", "Loss", "train_scl_curve")
-
     save_plot(args.store_name,train_losses, "Training Loss", "Loss", "train_loss_curve")
     save_plot(args.store_name,train_accs, "Training Accuracy", "Accuracy (%)", "train_accuracy_curve")
+    save_plot(args.store_name,train_precisions, "Training Precision", "Precision", "train_precision")
+    save_plot(args.store_name,train_recalls, "Training Recall", "Recall", "train_recall")
+    save_plot(args.store_name,train_f1s, "Training F1-Score", "F1-Score", "train_f1")
 
-    # Save training accuracy curve
-    # save_plot(top1.history, "Training Accuracy", "Accuracy (%)", "train_accuracy_curve")
 
     return num_per_classes, feature_list, feature_average
 
@@ -418,6 +453,9 @@ def evaluate(
     args,
     val_losses,
     val_accs,
+    val_precisions,
+    val_recalls,
+    val_f1s,
     tf_writer=None,
 ):
     model.eval()
@@ -432,7 +470,7 @@ def evaluate(
         desc=f"Evaluation...",
         ncols=150,
     )
-
+    y_true, y_pred = [], []  # Track predictions and labels
     with torch.no_grad():
         end = time.time()
         for i, data in enumerate(pbar):
@@ -453,6 +491,17 @@ def evaluate(
             ce_loss_all.update(ce_loss.item(), batch_size)
             top1.update(acc1[0].item(), batch_size)
 
+             # Store predictions and labels
+            y_true.extend(targets.cpu().numpy())  # Store true labels
+            y_pred.extend(torch.argmax(logits, dim=1).cpu().numpy())  # Store predicted labels
+
+
+            # ✅ Compute Precision, Recall, and F1-score at the END of epoch
+            precision = precision_score(y_true, y_pred, average="macro", zero_division=0)
+            recall = recall_score(y_true, y_pred, average="macro", zero_division=0)
+            f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
+
+
             batch_time.update(time.time() - end)
 
             pbar.set_description(
@@ -460,22 +509,32 @@ def evaluate(
                 f"BT({batch_time.avg:.3f}, {batch_time.val:.3f}) "
                 f"CE({ce_loss_all.avg:.4f}, {ce_loss_all.val:.4f}) "
                 f"Top-1_Accuracy({top1.avg:.3f}, {top1.val:.3f})"
+                f"Prec({precision:.3f}) "
+                f"Rec({recall:.3f}) "
+                f"F1({f1:.3f})"
             )
         val_losses.append(ce_loss_all.avg)
         val_accs.append(top1.avg)
+        val_precisions.append(precision)
+        val_recalls.append(recall)
+        val_f1s.append(f1)
         
         tf_writer.add_scalar("loss/CE_val", ce_loss_all.avg, epoch)
         tf_writer.add_scalar("acc/val_top1", top1.avg, epoch)
+        tf_writer.add_scalar("precision/val", precision, epoch)
+        tf_writer.add_scalar("recall/val", recall, epoch)
+        tf_writer.add_scalar("f1/val", f1, epoch)
 
         probs, preds = F.softmax(total_logits.detach(), dim=1).max(dim=1)
         many_acc_top1, median_acc_top1, low_acc_top1 = shot_acc(
             preds, total_labels, train_loader, acc_per_cls=False
         )
 
-        # save_plot(top1.history, "Validation Accuracy", "Accuracy (%)", "val_accuracy_curve")
-        # save_plot(ce_loss_all.history, "Validation CE Loss", "Loss", "val_loss_curve")
         save_plot(args.store_name,val_losses, "Validation Loss", "Loss", "val_loss_curve")
         save_plot(args.store_name,val_accs, "Validation Accuracy", "Accuracy (%)", "val_accuracy_curve")
+        save_plot(args.store_name, val_precisions, "Validation Precision", "Precision", "val_precision_curve")
+        save_plot(args.store_name, val_recalls, "Validation Recall", "Recall", "val_recall_curve")
+        save_plot(args.store_name, val_f1s, "Validation F1-score", "F1-score", "val_f1_curve")
 
         return top1.avg, many_acc_top1, median_acc_top1, low_acc_top1
 
